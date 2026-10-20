@@ -472,4 +472,8 @@ top1_last  <- concentration$top1_share[concentration$period == last_p]
 
 **A note on the data:** After the first half of 2023, the reports used here cover TV only, not movies. These recommendations therefore apply to series and live programming. Movie strategy would need separate data.
 
+::: {.callout-note title="AI Usage Statement" collapse="true"}
 
+I used a generative AI tool to help me understand the assignment, take notes on the steps, and fix my R code.
+
+:::
