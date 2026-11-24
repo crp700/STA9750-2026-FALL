@@ -1,5 +1,559 @@
 ---
-title: "Mini-Project Placeholder"
+title: "Mini-Project #03: Where My People At?"
+author: "Calvin Ravito Putra"
+format:
+  html:
+    code-fold: true
+    toc: true
+execute:
+  warning: false
+  message: false
 ---
 
-This is a placeholder for STA9750 Mini-Project 3. Check back soon for more!
+## Introduction
+
+This report explores where Korean-Americans live, both within New York City and across the United States. It combines three data sources: the Census Bureau's
+American Community Survey (ACS), NYC's official Neighborhood Tabulation Areas (NTAs), and PLUTO, the city's database of every tax lot and building. The
+analysis ends with an entry for *Welcomed by the New Colossus: An Atlas of American Communities*.
+
+## Data Acquisition
+
+### Setup
+
+All downloads are saved in `data/mp03`. Each file is downloaded once and read from disk after that. This is faster and avoids overloading public servers.
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(httr2)
+library(gt)
+library(scales)
+
+DATA_DIR    <- "data/mp03"
+dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+ACS_YEAR    <- 2024
+GROUP_LABEL <- "Korean"
+GROUP_VAR   <- "B02018_005"   # Korean alone or in any combination
+
+# Download ACS data only if it isn't already saved locally
+cached_acs <- function(file, geometry = FALSE, ...) {
+  path <- file.path(DATA_DIR, file)
+  if (!file.exists(path)) {
+    d <- get_acs(..., geometry = geometry, output = "wide")
+    if (geometry) write_sf(d, path) else write_csv(d, path)
+  }
+  if (geometry) {
+    read_sf(path)
+  } else {
+    read_csv(path, col_types = cols(GEOID = col_character()))
+  }
+}
+```
+
+### Task 1: Metro Area Population
+
+I use the 2024 ACS 5-year estimates, because the 1-year estimates hide counts for smaller groups.
+
+```{r}
+cbsa <- cached_acs(
+  "cbsa.gpkg", geometry = TRUE,
+  geography = "cbsa", year = ACS_YEAR, survey = "acs5",
+  variables = c(total = "B01003_001", group = GROUP_VAR)
+) |>
+  mutate(share = groupE / totalE)
+```
+
+### Task 2: NYC Census Tract Population
+
+Next, I download the same two variables (total population and Korean
+population) for every census tract in the five boroughs. Tracts are small
+areas of roughly 4,000 residents, which lets us see where people live
+block by block. I also download each tract's boundary shape, which I need
+for the spatial join and maps later in the report.
+
+```{r}
+tracts <- cached_acs(
+  "nyc_tracts.gpkg", geometry = TRUE,
+  geography = "tract", state = "NY",
+  county = c("New York", "Kings", "Queens", "Bronx", "Richmond"),
+  year = ACS_YEAR, survey = "acs5",
+  variables = c(total = "B01003_001", group = GROUP_VAR)
+)
+```
+
+### Task 3: NYC Neighborhood Tabulation Areas
+
+Census tracts are hard to interpret, so I map them to the city's official named neighborhoods. The shapefile is downloaded directly from NYC Planning.
+
+```{r}
+NTA_URL <- "https://s-media.nyc.gov/agencies/dcp/assets/files/zip/data-tools/bytes/neighborhood-tabulation-areas/nynta2020_26d.zip"
+
+load_nyc_nta <- function(url = NTA_URL) {
+  dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+  zip_path  <- file.path(DATA_DIR, "nynta2020.zip")
+  unzip_dir <- file.path(DATA_DIR, "nynta2020")
+
+  if (!file.exists(zip_path)) download.file(url, zip_path, mode = "wb")
+  if (!dir.exists(unzip_dir)) unzip(zip_path, exdir = unzip_dir)
+
+  shp <- list.files(unzip_dir, pattern = "\\.shp$",
+                    recursive = TRUE, full.names = TRUE)[1]
+
+  read_sf(shp) |>
+    select(NTA2020, NTAName, BoroName, NTAType)
+}
+
+nta <- load_nyc_nta()
+```
+
+### Task 4: Aggregating Tracts to Neighborhoods
+
+Tract and NTA boundaries don't line up exactly. A spatial join with `largest = TRUE` assigns each tract to the NTA it overlaps most, so no one is counted twice.
+
+```{r}
+tract_nta <- tracts |>
+  st_transform(st_crs(nta)) |>
+  st_join(nta, join = st_intersects, largest = TRUE)
+
+tract_lookup <- tract_nta |>
+  st_drop_geometry() |>
+  select(GEOID, NTA2020, NTAName, BoroName)
+
+nta_pop <- tract_nta |>
+  st_drop_geometry() |>
+  group_by(NTA2020) |>
+  summarize(total = sum(totalE, na.rm = TRUE),
+            group = sum(groupE, na.rm = TRUE)) |>
+  mutate(share = group / total)
+
+nta <- nta |> left_join(nta_pop, by = "NTA2020")
+```
+
+### Task 5: NYC PLUTO
+
+The PLUTO API returns a limited number of rows per request, so I page through it with `$limit` and `$offset` until a page comes back short.
+
+```{r}
+PLUTO_URL <- "https://data.cityofnewyork.us/resource/64uk-42ks.csv"
+
+load_pluto <- function(limit = 50000) {
+  path <- file.path(DATA_DIR, "pluto.csv")
+  if (!file.exists(path)) {
+    cols   <- c("bbl", "bct2020", "unitsres", "resarea", "officearea",
+                "comarea", "bldgarea", "numfloors")
+    pages  <- list()
+    offset <- 0
+    repeat {
+      txt <- request(PLUTO_URL) |>
+        req_url_query(`$limit`  = limit,
+                      `$offset` = offset,
+                      `$select` = paste(cols, collapse = ","),
+                      `$order`  = "bbl") |>
+        req_retry(max_tries = 5) |>
+        req_perform() |>
+        resp_body_string()
+      page <- read_csv(I(txt), col_types = cols(.default = col_character()))
+      pages[[length(pages) + 1]] <- page
+      message("Downloaded rows: ", offset + nrow(page))
+      if (nrow(page) < limit) break
+      offset <- offset + limit
+    }
+    bind_rows(pages) |> write_csv(path)
+  }
+  read_csv(path, col_types = cols(bbl = col_character(),
+                                  bct2020 = col_character()))
+}
+
+# bct2020 = borough digit + 6-digit tract. Convert to a Census GEOID.
+boro_fips <- c("1" = "061", "2" = "005", "3" = "047", "4" = "081", "5" = "085")
+
+pluto <- load_pluto() |>
+  filter(!is.na(bct2020)) |>
+  mutate(GEOID = paste0("36", boro_fips[substr(bct2020, 1, 1)],
+                        substr(bct2020, 2, 7)))
+
+tract_pluto <- pluto |>
+  group_by(GEOID) |>
+  summarize(office   = sum(replace_na(officearea, 0)),
+            units    = sum(unitsres, na.rm = TRUE),
+            resarea  = sum(resarea,  na.rm = TRUE),
+            comarea  = sum(comarea,  na.rm = TRUE),
+            bldgarea = sum(bldgarea, na.rm = TRUE))
+
+tract_df <- tracts |>
+  st_drop_geometry() |>
+  left_join(tract_pluto, by = "GEOID")
+```
+
+## Exploratory Data Analysis
+
+**Q1. Which tract has the most office space?**
+
+```{r}
+q1 <- tract_df |> slice_max(office, n = 1)
+```
+
+The tract with the most office floor area is **`r q1$NAME`**, with
+**`r comma(q1$office)` square feet** of office space.
+
+**Q2. Which neighborhood has the most residential units?**
+
+```{r}
+tract_pluto |>
+  left_join(tract_lookup, by = "GEOID") |>
+  group_by(NTAName, BoroName) |>
+  summarize(units = sum(units), .groups = "drop") |>
+  slice_max(units, n = 10) |>
+  gt() |>
+  tab_header(title = "NYC Neighborhoods with the Most Residential Units") |>
+  cols_label(NTAName = "Neighborhood", BoroName = "Borough",
+             units = "Residential Units") |>
+  fmt_number(units, decimals = 0)
+```
+
+**Q3. Which tract is most crowded relative to its housing?**
+
+I keep only tracts with at least 50 housing units. Tracts with almost no housing produce misleading ratios.
+
+```{r}
+q3 <- tract_df |>
+  filter(units >= 50, resarea > 0) |>
+  mutate(per_1000_sqft = 1000 * totalE / resarea,
+         per_unit      = totalE / units)
+
+q3 |>
+  slice_max(per_1000_sqft, n = 5) |>
+  select(NAME, totalE, per_1000_sqft, per_unit) |>
+  gt() |>
+  tab_header(title = "Most Crowded Tracts by Residential Floor Area") |>
+  cols_label(NAME = "Tract", totalE = "Population",
+             per_1000_sqft = "People per 1,000 sq ft",
+             per_unit = "People per Unit") |>
+  fmt_number(totalE, decimals = 0) |>
+  fmt_number(c(per_1000_sqft, per_unit), decimals = 2)
+
+q3_unit <- q3 |> slice_max(per_unit, n = 1)
+```
+
+Measured per housing unit instead, the most crowded tract is **`r q3_unit$NAME`**, at **`r round(q3_unit$per_unit, 1)` people per unit**. The two measures can rank tracts differently: a tract with many small apartments looks crowded per square foot but not per unit.
+
+**Q4. Which metro areas (other than NYC) have the largest Korean share?**
+
+```{r}
+cbsa |>
+  st_drop_geometry() |>
+  filter(GEOID != "35620", str_detect(NAME, "Metro Area")) |>
+  slice_max(share, n = 5) |>
+  select(NAME, totalE, groupE, share) |>
+  gt() |>
+  tab_header(title = "Metro Areas with the Highest Korean-American Share") |>
+  cols_label(NAME = "Metro Area", totalE = "Total Population",
+             groupE = "Korean-Americans", share = "Share") |>
+  fmt_number(c(totalE, groupE), decimals = 0) |>
+  fmt_percent(share, decimals = 2)
+```
+
+**Q5. What is the racial and ethnic mix of the Los Angeles metro?**
+
+```{r}
+la <- cached_acs(
+  "la_race.csv",
+  geography = "cbsa", year = ACS_YEAR, survey = "acs5",
+  variables = c(White = "B03002_003", Black = "B03002_004",
+                `Native American` = "B03002_005", Asian = "B03002_006",
+                `Pacific Islander` = "B03002_007", Other = "B03002_008",
+                Multiracial = "B03002_009", Hispanic = "B03002_012")
+) |>
+  filter(GEOID == "31080") |>
+  select(ends_with("E"), -NAME) |>
+  pivot_longer(everything(), names_to = "group",
+               names_pattern = "(.*)E$", values_to = "n")
+
+ggplot(la, aes(x = reorder(group, n), y = n)) +
+  geom_col(fill = "#5B4B8A") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Race and Ethnicity in the Los Angeles Metro Area",
+       subtitle = "Non-Hispanic groups by race, plus Hispanic of any race",
+       x = NULL, y = "Residents",
+       caption = "Source: ACS 2024 5-year estimates, table B03002") +
+  theme_minimal()
+```
+
+Los Angeles is one of the most diverse metros in the country. Hispanic residents are the largest group, and Asian-Americans, including the country's largest Korean community, make up a substantial share.
+
+**Q6. What share of all Korean-Americans live in New York and in major metros?**
+
+```{r}
+us <- cached_acs("us.csv", geography = "us", year = ACS_YEAR,
+                 survey = "acs5", variables = c(group = GROUP_VAR))
+ny <- cached_acs("ny.csv", geography = "state", state = "NY",
+                 year = ACS_YEAR, survey = "acs5",
+                 variables = c(group = GROUP_VAR))
+
+pct_ny          <- ny$groupE / us$groupE
+nyc_metro_share <- cbsa |> st_drop_geometry() |>
+  filter(GEOID == "35620") |> pull(groupE) / us$groupE
+la_metro_share  <- cbsa |> st_drop_geometry() |>
+  filter(GEOID == "31080") |> pull(groupE) / us$groupE
+
+cbsa |>
+  st_drop_geometry() |>
+  slice_max(groupE, n = 10) |>
+  mutate(pct_of_us = groupE / us$groupE) |>
+  select(NAME, groupE, pct_of_us) |>
+  gt() |>
+  tab_header(title = "Where Korean-Americans Live: Top 10 Metro Areas") |>
+  cols_label(NAME = "Metro Area", groupE = "Korean-Americans",
+             pct_of_us = "% of All U.S. Korean-Americans") |>
+  fmt_number(groupE, decimals = 0) |>
+  fmt_percent(pct_of_us, decimals = 1)
+```
+
+Of the **`r comma(us$groupE)`** Korean-Americans nationwide,
+**`r percent(pct_ny, 0.1)`** live in New York State. The New York metro area, which includes northern New Jersey, holds **`r percent(nyc_metro_share, 0.1)`**.
+
+**Q7. Is the relationship between population and housing linear?**
+
+```{r}
+ggplot(filter(tract_df, units > 0, totalE > 0),
+       aes(x = units, y = totalE)) +
+  geom_point(alpha = 0.3, color = "#5B4B8A") +
+  geom_smooth(color = "darkorange") +
+  scale_x_log10(labels = comma) +
+  scale_y_log10(labels = comma) +
+  labs(title = "Population vs. Housing Units in NYC Census Tracts",
+       x = "Residential units (log scale)",
+       y = "Population (log scale)",
+       caption = "Sources: ACS 2024 5-year; NYC PLUTO") +
+  theme_minimal()
+```
+
+The relationship is roughly linear on a log scale but far from exact. Tracts with the same number of units can differ widely in population, depending on household size and how many units are vacant or seasonal.
+
+**Q8. Which neighborhoods have the tallest buildings?**
+
+```{r}
+pluto |>
+  filter(numfloors > 0, bldgarea > 0) |>
+  left_join(tract_lookup, by = "GEOID") |>
+  group_by(NTAName, BoroName) |>
+  summarize(avg_floors = weighted.mean(numfloors, bldgarea),
+            max_floors = max(numfloors), .groups = "drop") |>
+  slice_max(avg_floors, n = 10) |>
+  gt() |>
+  tab_header(title = "NYC Neighborhoods with the Tallest Buildings",
+             subtitle = "Average floors, weighted by building floor area") |>
+  cols_label(NTAName = "Neighborhood", BoroName = "Borough",
+             avg_floors = "Avg. Floors", max_floors = "Tallest Building (Floors)") |>
+  fmt_number(avg_floors, decimals = 1) |>
+  fmt_number(max_floors, decimals = 0)
+```
+
+**Q9. How does population density vary across NYC?**
+
+```{r}
+tracts |>
+  mutate(density = totalE / (as.numeric(st_area(tracts)) / 2589988)) |>
+  ggplot() +
+  geom_sf(aes(fill = density), color = NA) +
+  scale_fill_viridis_c(labels = comma, trans = "sqrt",
+                       name = "People per\nsq. mile") +
+  labs(title = "Population Density Across New York City",
+       caption = "Source: ACS 2024 5-year estimates") +
+  theme_void()
+```
+
+Density peaks in the Bronx, upper Manhattan, and central Brooklyn, where some tracts exceed 200,000 people per square mile. It drops sharply in Staten Island, southeast Queens, and in tracts dominated by parks, airports, and
+cemeteries.
+
+**Q10. How many New Yorkers live in primarily commercial areas?**
+
+I define a tract as "primarily commercial" when more than half of its total building floor area is commercial.
+
+```{r}
+q10 <- tract_df |>
+  filter(bldgarea > 0, comarea / bldgarea > 0.5) |>
+  summarize(tracts = n(), pop = sum(totalE))
+```
+
+By this definition, **`r comma(q10$pop)`** New Yorkers live in
+**`r q10$tracts`** primarily commercial tracts. This is a surprisingly large number, and it shows how many New Yorkers live in mixed-use neighborhoods where
+apartments sit above or beside shops and offices.
+
+
+## Extra Credit
+
+### Interactive Graphics
+
+```{r}
+library(ggiraph)
+library(patchwork)
+
+# Interactive scatter (non-map): hover over a tract to see its details
+p_scatter <- ggplot(filter(tract_df, units > 0, totalE > 0),
+                    aes(x = units, y = totalE)) +
+  geom_point_interactive(
+    aes(tooltip = paste0(NAME, "\nUnits: ", comma(units),
+                         "\nPopulation: ", comma(totalE)),
+        data_id = GEOID),
+    alpha = 0.4, color = "#5B4B8A") +
+  scale_x_log10(labels = comma) +
+  scale_y_log10(labels = comma) +
+  labs(title = "Population vs. Housing Units (hover for details)",
+       x = "Residential units (log scale)", y = "Population (log scale)",
+       caption = "Sources: ACS 2024 5-year; NYC PLUTO") +
+  theme_minimal()
+
+girafe(ggobj = p_scatter,
+       options = list(opts_hover(css = "fill:orange;stroke:black;")))
+```
+
+The linked view below connects a map of Korean share by neighborhood to a bar
+chart of the 15 neighborhoods with the most Korean residents. Hovering over a
+neighborhood in either panel highlights it in both.
+
+```{r}
+nta_map <- nta |>
+  mutate(tip = paste0(NTAName, " (", BoroName, ")",
+                      "\nKorean residents: ", comma(replace_na(group, 0)),
+                      "\nShare: ", percent(replace_na(share, 0), 0.1)))
+
+top15 <- nta_map |>
+  st_drop_geometry() |>
+  slice_max(group, n = 15)
+
+p_map <- ggplot(nta_map) +
+  geom_sf_interactive(aes(fill = share, tooltip = tip, data_id = NTA2020),
+                      color = "white", linewidth = 0.1) +
+  scale_fill_distiller(palette = "Purples", direction = 1,
+                       labels = percent, name = "Korean share",
+                       na.value = "grey90") +
+  theme_void()
+
+p_bar <- ggplot(top15, aes(x = group, y = reorder(NTAName, group))) +
+  geom_col_interactive(aes(tooltip = tip, data_id = NTA2020),
+                       fill = "#5B4B8A") +
+  scale_x_continuous(labels = comma) +
+  labs(x = "Korean residents", y = NULL) +
+  theme_minimal()
+
+girafe(
+  ggobj = p_map + p_bar +
+    plot_layout(widths = c(1.3, 1)) +
+    plot_annotation(title = "Korean New York: Linked Map and Top Neighborhoods",
+                    caption = "Sources: ACS 2024 5-year; NYC 2020 NTAs"),
+  width_svg = 11, height_svg = 6,
+  options = list(opts_hover(css = "fill:orange;stroke:black;"))
+)
+```
+
+### Additional Census Tables
+
+To learn more about Korean neighborhoods, I compare NYC census tracts that are at least 10% Korean with the rest of the city. I use four non-ancestry tables: median household income (B19013), place of birth (B05002), housing tenure (B25003), and educational attainment (B15003).
+
+```{r}
+nyc_extra <- cached_acs(
+  "nyc_extra.csv",
+  geography = "tract", state = "NY",
+  county = c("New York", "Kings", "Queens", "Bronx", "Richmond"),
+  year = ACS_YEAR, survey = "acs5",
+  variables = c(total = "B01003_001", group = GROUP_VAR,
+                income = "B19013_001",
+                nativity = "B05002_001", foreign = "B05002_013",
+                hh = "B25003_001", owner = "B25003_002",
+                ed_total = "B15003_001", ba = "B15003_022",
+                ma = "B15003_023", prof = "B15003_024", phd = "B15003_025")
+)
+
+ec2 <- nyc_extra |>
+  filter(totalE > 0) |>
+  mutate(area = if_else(groupE / totalE >= 0.10,
+                        "Korean enclave tracts (10%+ Korean)",
+                        "Rest of NYC")) |>
+  group_by(area) |>
+  summarize(
+    tracts     = n(),
+    pop        = sum(totalE),
+    med_income = median(incomeE, na.rm = TRUE),
+    foreign    = sum(foreignE, na.rm = TRUE) / sum(nativityE, na.rm = TRUE),
+    owner      = sum(ownerE, na.rm = TRUE) / sum(hhE, na.rm = TRUE),
+    college    = sum(baE + maE + profE + phdE, na.rm = TRUE) /
+                 sum(ed_totalE, na.rm = TRUE)
+  )
+
+ec2 |>
+  gt() |>
+  tab_header(title = "Korean Enclaves Compared with the Rest of NYC",
+             subtitle = "Census tracts where at least 10% of residents are Korean") |>
+  cols_label(area = "", tracts = "Tracts", pop = "Population",
+             med_income = "Typical Tract Median Income",
+             foreign = "Foreign-Born", owner = "Homeowners",
+             college = "Bachelor's Degree or Higher") |>
+  fmt_number(c(tracts, pop), decimals = 0) |>
+  fmt_currency(med_income, decimals = 0) |>
+  fmt_percent(c(foreign, owner, college), decimals = 1) |>
+  data_color(columns = c(foreign, owner, college), palette = "Purples") |>
+  tab_source_note("Source: ACS 2024 5-year; tables B19013, B05002, B25003, B15003")
+
+enc  <- ec2 |> filter(area != "Rest of NYC")
+rest <- ec2 |> filter(area == "Rest of NYC")
+```
+
+## Atlas of American Communities Entry
+
+### Seoul in the Five Boroughs: Korean-Americans from Flushing to Honolulu
+
+Korean America began in Hawaii. On January 13, 1903, about a hundred Korean laborers arrived in Honolulu to work the sugar plantations, and more than a century later the islands still carry that history: Urban Honolulu has the highest Korean-American share of any metro area in the country, at 4.3 percent. For most of the twentieth century, restrictive immigration quotas kept the community small. That changed with the Immigration and Nationality Act of 1965, which ended the national-origins quota system and opened the door to a generation of Korean doctors, nurses, students, and small-business owners.
+
+Today, **`r comma(us$groupE)`** Americans identify as Korean.
+
+In New York, the heart of Korean life is in northeast Queens. Murray Hill–Broadway Flushing is home to 7,944 Korean residents, nearly 15 percent of the neighborhood, and the community runs east along Northern Boulevard through Auburndale, Bayside, and Douglaston–Little Neck, each of which is between 9 and 15 percent Korean. This corridor of barbecue restaurants, churches, hagwon tutoring centers, and late-night bakeries is the Korean New York most residents know. Manhattan's famous Koreatown on West 32nd Street, by contrast, is mostly a 24-hour commercial district rather than a place where people live.
+
+Altogether, **`r percent(pct_ny, 0.1)`** of all Korean-Americans live in New York State, and **`r percent(nyc_metro_share, 0.1)`** live in the greater New York metro area, including the heavily Korean towns of Fort Lee and Palisades Park in Bergen County, New Jersey.
+
+Census data also shows what life looks like in these neighborhoods. In the `r enc$tracts` NYC census tracts where at least one in ten residents is Korean, **`r percent(enc$foreign, 0.1)`** of residents were born abroad, compared with `r percent(rest$foreign, 0.1)` in the rest of the city. **`r percent(enc$owner, 0.1)`** of households own their homes, versus just `r percent(rest$owner, 0.1)` elsewhere in NYC, a sign of the settled, family-oriented, suburban character of northeast Queens. The typical median household income in these tracts is **`r dollar(enc$med_income)`**, compared
+with `r dollar(rest$med_income)` in the rest of the city. Nearly half of adults in these tracts, **`r percent(enc$college, 0.1)`**, hold a bachelor's degree or higher, compared with `r percent(rest$college, 0.1)` citywide.
+
+```{r}
+#| echo: false
+ggplot(nta) +
+  geom_sf(aes(fill = share), color = "white", linewidth = 0.1) +
+  scale_fill_distiller(palette = "Purples", direction = 1,
+                       labels = percent, name = "Korean share") +
+  labs(title = "Korean New Yorkers by Neighborhood",
+       subtitle = "Share of residents identifying as Korean",
+       caption = "Sources: ACS 2024 5-year; NYC 2020 NTAs") +
+  theme_void()
+```
+
+Nationally, the center of gravity is Southern California. The Los Angeles metro area is home to 343,006 Korean-Americans, **`r percent(la_metro_share, 0.1)`**
+of the national total and more than any other metro in the country. Its Koreatown, just west of downtown, grew from a handful of shops in the 1970s into one of the densest neighborhoods in the city, and it rebuilt itself after the 1992 unrest. Beyond Los Angeles, the community is concentrated along the Pacific: San Jose (2.2 percent Korean) and Seattle (2.1 percent) have some of the highest Korean shares in the country, driven in part by the technology industry.
+
+```{r}
+#| echo: false
+cbsa |>
+  filter(groupE > 0) |>
+  tigris::shift_geometry() |>
+  st_point_on_surface() |>
+  ggplot() +
+  geom_sf(aes(size = groupE, color = share), alpha = 0.7) +
+  scale_size_area(max_size = 14, labels = comma, name = "Korean-Americans") +
+  scale_color_viridis_c(labels = percent, name = "Share of metro") +
+  labs(title = "Korean-Americans Across U.S. Metro Areas",
+       caption = "Source: ACS 2024 5-year estimates") +
+  theme_void()
+```
+
+For travelers, the lesson is simple: start in Flushing with a bowl of naengmyeon, cross the country for soondubu in Los Angeles after midnight, and end where the story began, in Honolulu. Korean America is not one place but a
+network of communities stretching from the Pacific to the Atlantic, each with its own flavor.
+
+## Conclusion
+
+Korean-Americans are concentrated in a small number of places. More than a quarter live in just two metro areas, Los Angeles and New York, and the highest shares are found in Hawaii, where Korean immigration to the United States began. Within New York City, the community is clustered along a single corridor in northeast Queens rather than spread across the five boroughs. Combining Census data with PLUTO's building records also shows how closely NYC's population follows its housing stock, from dense apartment blocks in the Bronx and upper Manhattan to the low-rise neighborhoods of Staten Island and eastern Queens.
+
+::: {.callout-note title="AI Usage Statement" collapse="true"}
+I used AI to help me spot errors in my R code and understand what was causing them when I hit a roadblock. I wrote and ran the analysis myself.
+:::
+
